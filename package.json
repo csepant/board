@@ -1,0 +1,16 @@
+{
+  "name": "board",
+  "version": "0.1.0",
+  "description": "A local room where humans and agents collaborate from the terminal",
+  "type": "module",
+  "bin": {
+    "board": "src/cli.ts"
+  },
+  "scripts": {
+    "serve": "bun src/cli.ts serve",
+    "board": "bun src/cli.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
