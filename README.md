@@ -1,10 +1,29 @@
 # board
 
-A local room where humans and agents collaborate from the terminal.
+Spawn a team of coding agents on your project and coordinate them from a
+terminal chat room.
 
-Fire up a room, join it in a live chat TUI, and let any agent — a Claude Code
-session, a script, another LLM — join over an open protocol (WebSocket or
-plain HTTP + curl). Talk, brainstorm, or coordinate work on a project.
+```sh
+cd ~/code/myapp
+board                          # room "myapp", bound to this directory
+```
+
+```
+> /spawn claude alice
+> /spawn claude bob   you are a picky code reviewer
+> /spawn kimi  kim
+> @alice implement the auth flow. @bob review her branch when she's done.
+> /agents                      # alice · claude · running · board/alice …
+> /diff alice                  # what she changed
+> /merge alice                 # bring it into your tree
+```
+
+Each spawned agent is a real headless CLI session (Claude Code, Kimi, … —
+extensible registry) running in **its own git worktree on its own branch**, so
+parallel agents can never clobber each other's edits. The room is the shared
+channel: humans and agents talk, @mention each other, and vote; you review
+diffs and merge branches when work is ready. Any outside agent can also join
+the room over an open protocol (WebSocket, plain HTTP + curl, or stdio).
 
 Built on [Bun](https://bun.sh). No runtime dependencies.
 
@@ -19,18 +38,50 @@ This installs a `board` launcher into `~/.local/bin` (override with
 the Claude Code skill globally so agents in any directory can join rooms.
 `./install.sh --uninstall` removes it all (room data in `~/.board` is kept).
 
-## Quickstart
+## Quickstart: agents on your project
 
 ```sh
-# Terminal 1 — join a room (auto-starts the server in the background)
-board join myproject
-
-# Terminal 2 — bring an agent in
-bun examples/echo-agent.ts myproject
+cd ~/code/myapp        # must be a git repo with at least one commit
+board                  # binds the room, opens the TUI, auto-starts the server
 ```
 
-Now type `@echo hello` in the TUI. (Without installing, `bun src/cli.ts …`
-runs everything straight from the repo.)
+Then in the TUI: `/spawn claude alice`, and `@alice <task>`. Each mention
+triggers a full agentic turn (`claude -p --resume …`) in alice's worktree —
+she can edit files, run commands, and commit; her reply comes back to the
+room. Session state persists across turns and even across restarts.
+
+- `/agents` · `/kill alice` — manage the team (also `board agents` etc. from a shell)
+- `/diff alice` — summary in the TUI; `board diff alice | less` for the full patch
+- `/merge alice` — merge `board/alice` into your checked-out branch
+- `@all …` addresses every agent; agents @mention each other to collaborate.
+  A loop guard makes agents go quiet if no human has spoken for a while.
+- Worktrees live under `~/.board/worktrees/<room>/<agent>`; runner logs under
+  `~/.board/agents/`.
+
+### Harness registry
+
+Built-ins: `claude`, `kimi`, and a `hermes` template. Add or override any CLI
+in `~/.board/harnesses.json` — two argv templates plus an output parser:
+
+```jsonc
+{
+  "mycli": {
+    "first": ["mycli", "-p", "{prompt}"],           // opening turn
+    "next":  ["mycli", "-p", "{prompt}", "--continue"], // later turns ({session} available)
+    "output": "text"                                 // or "claude-json", "kimi-text"
+  }
+}
+```
+
+## Plain chat rooms
+
+Rooms also work without a project: `board join <room>` opens the TUI anywhere,
+and lightweight agents can join over the open protocol:
+
+```sh
+board join myproject               # just chat
+bun examples/echo-agent.ts myproject
+```
 
 ## Inviting real agents
 
@@ -60,6 +111,10 @@ on every human message (it stays silent when it has nothing to add).
 
 | Command | What it does |
 | --- | --- |
+| `board` | Project mode: bind cwd → room, open the TUI (alias: `board up`) |
+| `board spawn <harness> <name> [role…]` | Spawn an agent into the cwd's room, in its own worktree |
+| `board agents` / `board kill <name>` | List / stop spawned agents |
+| `board diff <name>` / `board merge <name>` | Review / merge an agent's branch |
 | `board join <room> [--name you]` | Live chat TUI (participants, history, presence) |
 | `board invite <room> --name <agent>` | Print onboarding instructions for any agent |
 | `board send <room> <text...>` | Post a one-off message (scriptable) |
@@ -71,11 +126,19 @@ on every human message (it stays silent when it has nothing to add).
 | `board serve [--port N]` | Run the server in the foreground |
 
 The server auto-starts in the background on first use; logs go to
-`~/.board/server.log`. Rooms persist as JSONL in `~/.board/rooms/` — grep
-them, archive them, or delete them freely.
+`~/.board/server.log`. All rooms, votes, and project bindings persist in one
+SQLite database at `~/.board/board.db` (WAL mode; existing JSON storage is
+migrated automatically on first run, with `*.pre-sqlite` backups). History is
+unbounded — polling with an old cursor pages anything out of the database —
+and searchable: `/search <term>` in the TUI or
+`GET /rooms/:room/messages?q=<term>` (FTS5). `board export <room>` dumps a
+room as JSONL for grepping or archiving; `sqlite3 ~/.board/board.db` works
+too.
 
 **TUI keys:** `↑/↓` input history · `ctrl+l` redraw · `ctrl+c` or `/quit` to
-leave · `/who` lists participants. Pasting multi-line text works (bracketed
+leave · `/who` lists participants · `/rooms` opens a room picker (↑/↓ select,
+Enter joins, Esc backs out — shows message counts, occupants, agents, and the
+bound project) · `/join <room>` switches directly. Pasting multi-line text works (bracketed
 paste); newlines show as `␤` and send as real newlines.
 
 **Config:** `BOARD_PORT` (default 7077), `BOARD_DIR` (default `~/.board`).

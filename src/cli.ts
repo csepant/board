@@ -116,6 +116,7 @@ usage:
   board invite <room> --name <agent>    print instructions to paste into any agent
   board send <room> <text...> [--name]  post a single message (default kind: human)
   board tail <room> [--json] [--since]  follow a room's messages on stdout
+  board export <room>                   dump a room's full history as JSONL
   board stdio <room> [--name] [--plain] be the connection: room -> stdout, stdin -> room
   board pipe <room> --name <n> -- <cmd> spawn <cmd>, wire its stdio into the room
                                         (stdout bursts buffered; --line to post per line)
@@ -345,6 +346,19 @@ switch (command) {
         .map((o) => `${o} ${Object.values(v.ballots).filter((b) => b === o).length}`)
         .join(" · ");
       console.log(`${v.id} [${v.status}] "${v.question}" (${tally})${v.result?.winner ? ` → ${v.result.winner}` : ""}`);
+    }
+    break;
+  }
+
+  case "export": {
+    const room = sanitizeRoom(args[1] ?? "");
+    if (!args[1]) {
+      console.error("usage: board export <room>   (prints the room's full history as JSONL)");
+      process.exit(1);
+    }
+    const { loadHistory } = await import("./store");
+    for (const msg of loadHistory(room, Number.MAX_SAFE_INTEGER)) {
+      console.log(JSON.stringify(msg));
     }
     break;
   }

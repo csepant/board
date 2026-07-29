@@ -26,9 +26,11 @@ const BUILTINS: Record<string, Harness> = {
     output: "claude-json",
   },
   kimi: {
-    first: ["kimi", "-p", "{prompt}", "--auto"],
-    next: ["kimi", "-p", "{prompt}", "--auto", "-c"],
-    output: "text",
+    // kimi's prompt mode rejects --auto/--yolo; it is non-interactive on its own.
+    // -c continues the previous session for the working directory (= this worktree).
+    first: ["kimi", "-p", "{prompt}"],
+    next: ["kimi", "-p", "{prompt}", "-c"],
+    output: "kimi-text",
   },
   // Placeholder — flags unverified (hermes isn't installed here). Override in
   // ~/.board/harnesses.json if yours differ.
@@ -66,6 +68,15 @@ export function parseOutput(harness: Harness, stdout: string): [string, string |
     } catch {
       return [stdout.trim(), null]; // fall back to raw text
     }
+  }
+  if (harness.output === "kimi-text") {
+    const cleaned = stdout
+      .split("\n")
+      .filter((line) => !/^To resume this session:/.test(line.trim()))
+      .join("\n")
+      .trim()
+      .replace(/^•\s*/, "");
+    return [cleaned, null];
   }
   return [stdout.trim(), null];
 }

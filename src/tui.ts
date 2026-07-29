@@ -4,7 +4,7 @@
 import { StringDecoder } from "node:string_decoder";
 import { BoardClient } from "./client";
 import type { ChatMessage, Participant, Vote } from "./protocol";
-import { DEFAULT_PORT } from "./protocol";
+import { DEFAULT_PORT, sanitizeRoom } from "./protocol";
 
 const ESC = "\x1b";
 const CSI = `${ESC}[`;
@@ -28,6 +28,19 @@ export async function runTui(opts: { room: string; name: string; port?: number }
   let participants: Participant[] = [];
   let you = opts.name;
   let status = "connecting…";
+  let room = opts.room;
+
+  // rooms picker overlay
+  interface RoomInfo {
+    name: string;
+    participants: { name: string; kind: string }[];
+    cursor: number;
+    project: string | null;
+    agents: string[];
+  }
+  let mode: "chat" | "rooms" = "chat";
+  let roomList: RoomInfo[] = [];
+  let sel = 0;
 
   // --- input state ---------------------------------------------------------
   let buf = "";
@@ -102,7 +115,7 @@ export async function runTui(opts: { room: string; name: string; port?: number }
     const names = participants
       .map((p) => (p.name === you ? `${p.name} (you)` : p.kind === "agent" ? `${p.name}*` : p.name))
       .join("  ");
-    const text = ` #${opts.room}  ·  ${names || "just you"}  ·  ${status}`;
+    const text = ` #${room}  ·  ${names || "just you"}  ·  ${status}`;
     write(`${CSI}s${CSI}${headerRow()};1H${CSI}2K${CSI}7m${text.slice(0, cols).padEnd(cols)}${CSI}0m${CSI}u`);
   }
 
@@ -111,6 +124,7 @@ export async function runTui(opts: { room: string; name: string; port?: number }
   }
 
   function drawInput() {
+    if (mode === "rooms") return; // the picker draws its own hint line
     const prompt = "› ";
     const visibleWidth = cols - prompt.length - 1;
     const display = buf.replace(/\n/g, "␤");
@@ -127,6 +141,10 @@ export async function runTui(opts: { room: string; name: string; port?: number }
     write(`${CSI}${regionTop()};${regionBottom()}r`);
     drawHeader();
     drawSep();
+    if (mode === "rooms") {
+      drawRooms();
+      return;
+    }
     const lines = entries.slice(-300).flatMap(renderEntry).slice(-regionHeight());
     const startRow = regionBottom() - lines.length + 1;
     lines.forEach((line, i) => {
@@ -138,6 +156,7 @@ export async function runTui(opts: { room: string; name: string; port?: number }
   function appendEntry(entry: Entry) {
     entries.push(entry);
     if (entries.length > 600) entries.splice(0, entries.length - 400);
+    if (mode !== "chat") return; // picker is up; entries render on return to chat
     for (const line of renderEntry(entry)) {
       // Scroll the region by newlining at its bottom row, then paint the line.
       write(`${CSI}${regionBottom()};1H\n${CSI}2K${line}`);
@@ -145,11 +164,81 @@ export async function runTui(opts: { room: string; name: string; port?: number }
     drawInput();
   }
 
+  // --- rooms picker --------------------------------------------------------
+  async function openRoomsView() {
+    try {
+      const res = await fetch(`http://localhost:${port}/rooms`);
+      roomList = ((await res.json()) as { rooms: RoomInfo[] }).rooms;
+    } catch (e) {
+      sysLine(`rooms failed: ${e}`);
+      return;
+    }
+    if (roomList.length === 0) {
+      sysLine("no rooms yet — this one will appear once someone speaks");
+      return;
+    }
+    sel = Math.max(0, roomList.findIndex((r) => r.name === room));
+    mode = "rooms";
+    fullRedraw();
+  }
+
+  function drawRooms() {
+    const top = regionTop();
+    const height = regionHeight();
+    for (let i = 0; i < height; i++) write(`${CSI}${top + i};1H${CSI}2K`);
+    write(`${CSI}${top};1H${CSI}1mrooms${CSI}0m ${dim(`(${roomList.length})`)}`);
+
+    const maxRows = Math.max(1, height - 2);
+    const start = Math.max(0, Math.min(sel - Math.floor(maxRows / 2), roomList.length - maxRows));
+    roomList.slice(start, start + maxRows).forEach((r, i) => {
+      const idx = start + i;
+      const people = r.participants.map((p) => (p.kind === "agent" ? `${p.name}*` : p.name)).join(" ");
+      const parts = [
+        `#${r.name}${r.name === room ? " (here)" : ""}`,
+        `${r.cursor} msg${r.cursor === 1 ? "" : "s"}`,
+        people || "empty",
+      ];
+      if (r.agents?.length) parts.push(`agents: ${r.agents.join(" ")}`);
+      if (r.project) parts.push(r.project);
+      const line = ` ${parts.join("  ·  ")}`.slice(0, cols);
+      const row = top + 2 + i;
+      if (idx === sel) write(`${CSI}${row};1H${CSI}7m${line.padEnd(cols)}${CSI}0m`);
+      else write(`${CSI}${row};1H${line}`);
+    });
+    write(`${CSI}${inputRow()};1H${CSI}2K${dim("↑/↓ select · enter join · esc/q back")}`);
+  }
+
+  function closeRoomsView() {
+    mode = "chat";
+    fullRedraw();
+  }
+
+  function switchRoom(next: string) {
+    const target = sanitizeRoom(next);
+    mode = "chat";
+    if (target === room) {
+      fullRedraw();
+      sysLine(`already in #${room}`);
+      return;
+    }
+    client.close();
+    room = target;
+    entries.length = 0;
+    seenIds.clear();
+    participants = [];
+    status = "connecting…";
+    client = makeClient();
+    fullRedraw();
+    sysLine(`joining #${room}…`);
+    client.connect();
+  }
+
   const sysLine = (text: string) => appendEntry({ kind: "sys", text, ts: Date.now() });
 
   // --- client --------------------------------------------------------------
-  const client = new BoardClient({
-    room: opts.room,
+  function makeClient(): BoardClient {
+    return new BoardClient({
+    room,
     name: opts.name,
     kind: "human",
     port,
@@ -185,7 +274,9 @@ export async function runTui(opts: { room: string; name: string; port?: number }
       drawHeader();
       drawInput();
     },
-  });
+    });
+  }
+  let client = makeClient();
 
   // --- input handling ------------------------------------------------------
   function submit() {
@@ -204,7 +295,36 @@ export async function runTui(opts: { room: string; name: string; port?: number }
     if (text === "/help") {
       sysLine("agents: /spawn <harness> <name> [role…] · /agents · /kill <name> · /diff <name> · /merge <name>");
       sysLine("votes: /vote <question> [| opt | opt] · /cast <id> <option> · /close <id> · /votes");
-      sysLine("misc: /who · /quit · keys: ctrl+c quit, ctrl+l redraw, ↑/↓ input history");
+      sysLine("rooms: /rooms (picker) · /join <room> · misc: /search <term> · /who · /quit");
+      sysLine("keys: ctrl+c quit, ctrl+l redraw, ↑/↓ input history");
+      return;
+    }
+    if (text === "/rooms") {
+      void openRoomsView();
+      return;
+    }
+    const search = text.match(/^\/search\s+(.+)$/);
+    if (search) {
+      void (async () => {
+        try {
+          const res = await fetch(
+            `http://localhost:${port}/rooms/${room}/messages?q=${encodeURIComponent(search[1])}&limit=8`,
+          );
+          const { messages } = (await res.json()) as { messages: ChatMessage[] };
+          if (messages.length === 0) return sysLine(`no matches for "${search[1]}"`);
+          for (const m of messages.reverse()) {
+            const when = new Date(m.ts).toLocaleDateString();
+            sysLine(`[${m.seq} · ${when}] ${m.from}: ${m.text.slice(0, cols * 2)}`);
+          }
+        } catch (e) {
+          sysLine(`search failed: ${e}`);
+        }
+      })();
+      return;
+    }
+    const joinCmd = text.match(/^\/join\s+(\S+)$/);
+    if (joinCmd) {
+      switchRoom(joinCmd[1]);
       return;
     }
     const spawn = text.match(/^\/spawn\s+(\S+)\s+(\S+)(?:\s+(.+))?$/);
@@ -217,7 +337,7 @@ export async function runTui(opts: { room: string; name: string; port?: number }
     if (text === "/agents") {
       void (async () => {
         try {
-          const res = await fetch(`http://localhost:${port}/rooms/${opts.room}/agents`);
+          const res = await fetch(`http://localhost:${port}/rooms/${room}/agents`);
           const { agents } = (await res.json()) as {
             agents: { name: string; harness: string; status: string; branch: string }[];
           };
@@ -238,7 +358,7 @@ export async function runTui(opts: { room: string; name: string; port?: number }
     if (diff) {
       void (async () => {
         try {
-          const res = await fetch(`http://localhost:${port}/rooms/${opts.room}/agents/${diff[1]}/diff`);
+          const res = await fetch(`http://localhost:${port}/rooms/${room}/agents/${diff[1]}/diff`);
           const body = (await res.json()) as { error?: string; stat?: string; dirty?: string };
           if (!res.ok) return sysLine(`diff failed: ${body.error}`);
           sysLine(body.stat?.trim() ? body.stat.trim() : "no committed changes vs your tree");
@@ -287,7 +407,7 @@ export async function runTui(opts: { room: string; name: string; port?: number }
   /** Call a room endpoint; returns an error string or null (results arrive as system messages). */
   async function api(path: string, method: string, body?: Record<string, unknown>): Promise<string | null> {
     try {
-      const res = await fetch(`http://localhost:${port}/rooms/${opts.room}${path}`, {
+      const res = await fetch(`http://localhost:${port}/rooms/${room}${path}`, {
         method,
         headers: { "content-type": "application/json" },
         ...(body ? { body: JSON.stringify({ from: you, ...body }) } : {}),
@@ -306,7 +426,7 @@ export async function runTui(opts: { room: string; name: string; port?: number }
 
   async function listVotes() {
     try {
-      const res = await fetch(`http://localhost:${port}/rooms/${opts.room}/votes`);
+      const res = await fetch(`http://localhost:${port}/rooms/${room}/votes`);
       const { votes } = (await res.json()) as { votes: Vote[] };
       if (votes.length === 0) return sysLine("no votes yet — open one with /vote <question> [| opt | opt]");
       for (const v of votes.slice(-10)) {
@@ -345,6 +465,13 @@ export async function runTui(opts: { room: string; name: string; port?: number }
   }
 
   function handleCsi(seq: string) {
+    if (mode === "rooms") {
+      if (seq === "A") sel = Math.max(0, sel - 1);
+      else if (seq === "B") sel = Math.min(roomList.length - 1, sel + 1);
+      else return;
+      drawRooms();
+      return;
+    }
     switch (seq) {
       case "A": historyNav(-1); break;
       case "B": historyNav(1); break;
@@ -359,6 +486,13 @@ export async function runTui(opts: { room: string; name: string; port?: number }
   }
 
   function handleChar(ch: string) {
+    if (mode === "rooms") {
+      if (ch === "\r" || ch === "\n") switchRoom(roomList[sel].name);
+      else if (ch === "q") closeRoomsView();
+      else if (ch === "\x03" || ch === "\x04") quit();
+      else if (ch === "\x0c") fullRedraw();
+      return;
+    }
     switch (ch) {
       case "\r": case "\n": submit(); return;
       case "\x7f": case "\b":
@@ -386,6 +520,11 @@ export async function runTui(opts: { room: string; name: string; port?: number }
   function feed(chunk: string) {
     let data = pending + chunk;
     pending = "";
+    // In the picker, a lone ESC byte is the Esc key (sequences arrive whole).
+    if (mode === "rooms" && data === ESC) {
+      closeRoomsView();
+      return;
+    }
     let i = 0;
     while (i < data.length) {
       if (inPaste) {
@@ -455,7 +594,7 @@ export async function runTui(opts: { room: string; name: string; port?: number }
   process.on("exit", teardown);
 
   fullRedraw();
-  sysLine(`joining #${opts.room} on localhost:${port} — /help for commands`);
+  sysLine(`joining #${room} on localhost:${port} — /help for commands`);
   client.connect();
 
   // Keep the process alive; quit() exits.

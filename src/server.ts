@@ -24,8 +24,11 @@ import {
   loadHistory,
   loadProjects,
   loadVotes,
+  maxSeq,
+  messagesAfter,
   saveProjects,
   saveVotes,
+  searchMessages,
 } from "./store";
 import { loadHarnesses } from "./harness";
 import { diffWorktree, ensureWorktree, mergeAgentBranch } from "./worktree";
@@ -264,8 +267,19 @@ function agentInfo(agent: AgentProc) {
   return { ...rest, pid: proc.pid };
 }
 
+/** Messages with seq > since — from the in-memory cache when it covers the
+ *  cursor, else paged out of SQLite (deep history predating the cache). */
+function collectAfter(room: Room, since: number, limit: number): ChatMessage[] {
+  const oldestCached = room.history[0]?.seq;
+  if (oldestCached === undefined || since >= oldestCached - 1) {
+    const messages = room.history.filter((m) => m.seq > since);
+    return limit > 0 ? messages.slice(-limit) : messages;
+  }
+  return messagesAfter(room.name, since, limit > 0 ? limit : 200);
+}
+
 async function messagesSince(room: Room, since: number, waitSec: number, limit: number) {
-  let messages = room.history.filter((m) => m.seq > since);
+  let messages = collectAfter(room, since, limit);
   if (messages.length === 0 && waitSec > 0) {
     await new Promise<void>((resolve) => {
       const timer = setTimeout(resolve, Math.min(waitSec, 60) * 1000);
@@ -274,9 +288,8 @@ async function messagesSince(room: Room, since: number, waitSec: number, limit: 
         resolve();
       });
     });
-    messages = room.history.filter((m) => m.seq > since);
+    messages = collectAfter(room, since, limit);
   }
-  if (limit > 0) messages = messages.slice(-limit);
   return { messages, cursor: room.seq };
 }
 
@@ -311,7 +324,7 @@ export function startServer(port: number = DEFAULT_PORT): Server<WSData> {
           return {
             name,
             participants: room ? participantList(room) : [],
-            cursor: room ? room.seq : loadHistory(name).at(-1)?.seq ?? 0,
+            cursor: room ? room.seq : maxSeq(name),
             project: room?.project ?? projects[name] ?? null,
             agents: room ? [...room.agents.values()].map((a) => `${a.name}[${a.status}]`) : [],
           };
@@ -324,9 +337,13 @@ export function startServer(port: number = DEFAULT_PORT): Server<WSData> {
         const room = getRoom(sanitizeRoom(decodeURIComponent(match[1])));
 
         if (req.method === "GET") {
+          const q = url.searchParams.get("q");
+          const limit = Number(url.searchParams.get("limit") ?? 200) || 200;
+          if (q) {
+            return json({ messages: searchMessages(room.name, q, limit), cursor: room.seq });
+          }
           const since = Number(url.searchParams.get("since") ?? 0) || 0;
           const wait = Number(url.searchParams.get("wait") ?? 0) || 0;
-          const limit = Number(url.searchParams.get("limit") ?? 200) || 200;
           return json(await messagesSince(room, since, wait, limit));
         }
 
@@ -506,7 +523,7 @@ export function startServer(port: number = DEFAULT_PORT): Server<WSData> {
             room: room.name,
             you: name,
             participants: participantList(room),
-            history: since > 0 ? room.history.filter((m) => m.seq > since) : room.history.slice(-50),
+            history: since > 0 ? collectAfter(room, since, 500) : room.history.slice(-50),
             cursor: room.seq,
           };
           ws.send(JSON.stringify(welcome));
