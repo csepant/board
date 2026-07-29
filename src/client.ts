@@ -115,9 +115,8 @@ export class BoardClient {
   }
 
   /**
-   * Fire-and-forget ephemeral activity frame ("what am I doing right now").
-   * Never queued: a stale activity line is worse than none, so frames sent
-   * while disconnected are dropped. Servers without activity support ignore it.
+   * Broadcast an ephemeral activity frame (live tool-use status). Fire-and-
+   * forget: dropped when disconnected, never queued — activity is ephemeral.
    */
   sendActivity(tool: string, detail: string) {
     if (this.ws?.readyState === WebSocket.OPEN) {
