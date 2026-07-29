@@ -3,6 +3,7 @@
 // never see duplicate messages across reconnects.
 
 import type {
+  ActivityFrame,
   ChatMessage,
   Kind,
   PresenceFrame,
@@ -20,6 +21,7 @@ export interface BoardClientOptions {
   onWelcome?: (welcome: WelcomeFrame) => void;
   onMessage?: (msg: ChatMessage) => void;
   onPresence?: (presence: PresenceFrame) => void;
+  onActivity?: (activity: ActivityFrame) => void;
   onStatus?: (status: string) => void;
 }
 
@@ -82,6 +84,9 @@ export class BoardClient {
         case "presence":
           this.opts.onPresence?.(frame);
           break;
+        case "activity":
+          this.opts.onActivity?.(frame);
+          break;
         case "error":
           this.opts.onStatus?.(`server error: ${frame.message}`);
           break;
@@ -112,6 +117,16 @@ export class BoardClient {
     if (this.outbox.length >= 100) return false;
     this.outbox.push(text);
     return true;
+  }
+
+  /**
+   * Broadcast an ephemeral activity frame (live tool-use status). Fire-and-
+   * forget: dropped when disconnected, never queued — activity is ephemeral.
+   */
+  sendActivity(tool: string, detail: string) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "activity", tool, detail }));
+    }
   }
 
   close() {

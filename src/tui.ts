@@ -3,7 +3,7 @@
 
 import { StringDecoder } from "node:string_decoder";
 import { BoardClient } from "./client";
-import type { ChatMessage, Participant, Vote } from "./protocol";
+import type { ActivityFrame, ChatMessage, Participant, Vote } from "./protocol";
 import { DEFAULT_PORT, sanitizeRoom } from "./protocol";
 
 const ESC = "\x1b";
@@ -52,10 +52,31 @@ export async function runTui(opts: { room: string; name: string; port?: number }
   let pending = ""; // partial escape sequence / paste marker across chunks
   const decoder = new StringDecoder("utf8");
 
+  // --- live agent activity -------------------------------------------------
+  // Latest ephemeral activity frame per agent, rendered as dimmed status
+  // lines between the chat region and the separator. Never enters `entries`.
+  const ACTIVITY_TTL = 90_000;
+  const ACTIVITY_MAX_ROWS = 3;
+  const activities = new Map<string, ActivityFrame>();
+
+  function pruneActivities(): boolean {
+    const now = Date.now();
+    let changed = false;
+    for (const [name, a] of activities) {
+      if (now - a.ts > ACTIVITY_TTL) {
+        activities.delete(name);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  const activityRowCount = () => Math.min(activities.size, ACTIVITY_MAX_ROWS);
+
   // --- layout --------------------------------------------------------------
   const headerRow = () => 1;
   const regionTop = () => 2;
-  const regionBottom = () => rows - 2;
+  const regionBottom = () => rows - 2 - activityRowCount();
   const sepRow = () => rows - 1;
   const inputRow = () => rows;
   const regionHeight = () => regionBottom() - regionTop() + 1;
@@ -123,6 +144,21 @@ export async function runTui(opts: { room: string; name: string; port?: number }
     write(`${CSI}${sepRow()};1H${CSI}2K${dim("─".repeat(cols))}`);
   }
 
+  /** One dimmed status line per busy agent, e.g. "⚙ bob · Bash · git commit…". */
+  function drawActivity() {
+    const count = activityRowCount();
+    if (count === 0) return;
+    const top = sepRow() - count;
+    const shown = [...activities.values()].slice(-count);
+    shown.forEach((a, i) => {
+      const fixed = ` ⚙ ${a.from} · ${a.tool} · `;
+      const budget = Math.max(8, cols - fixed.length - 1);
+      const detail = a.detail.length > budget ? `${a.detail.slice(0, budget - 1)}…` : a.detail;
+      const line = `${dim(" ⚙ ")}${colored(a.from)}${dim(" · ")}${CSI}36m${a.tool}${CSI}39m${dim(` · ${detail}`)}`;
+      write(`${CSI}${top + i};1H${CSI}2K${line}`);
+    });
+  }
+
   function drawInput() {
     if (mode === "rooms") return; // the picker draws its own hint line
     const prompt = "› ";
@@ -141,6 +177,7 @@ export async function runTui(opts: { room: string; name: string; port?: number }
     write(`${CSI}${regionTop()};${regionBottom()}r`);
     drawHeader();
     drawSep();
+    drawActivity();
     if (mode === "rooms") {
       drawRooms();
       return;
@@ -226,6 +263,7 @@ export async function runTui(opts: { room: string; name: string; port?: number }
     entries.length = 0;
     seenIds.clear();
     participants = [];
+    activities.clear();
     status = "connecting…";
     client = makeClient();
     fullRedraw();
@@ -258,16 +296,29 @@ export async function runTui(opts: { room: string; name: string; port?: number }
     onMessage: (msg) => {
       if (seenIds.has(msg.id)) return;
       seenIds.add(msg.id);
+      // A reply ends the turn — drop that agent's activity status line.
+      if (activities.delete(msg.from)) fullRedraw();
       if (msg.kind === "system") appendEntry({ kind: "sys", text: msg.text, ts: msg.ts });
       else appendEntry({ kind: "msg", msg });
     },
     onPresence: (presence) => {
       participants = presence.participants;
+      if (presence.event === "leave" && activities.delete(presence.name)) fullRedraw();
       drawHeader();
       if (presence.name !== you) {
         sysLine(`${presence.name}${presence.kind === "agent" ? " (agent)" : ""} ${presence.event === "join" ? "joined" : "left"}`);
       }
       drawInput();
+    },
+    onActivity: (activity) => {
+      pruneActivities();
+      const before = activityRowCount();
+      activities.set(activity.from, activity);
+      if (activityRowCount() !== before) fullRedraw(); // row count changed: scroll region moved
+      else {
+        drawActivity();
+        drawInput();
+      }
     },
     onStatus: (s) => {
       status = s;
@@ -566,7 +617,13 @@ export async function runTui(opts: { room: string; name: string; port?: number }
   }
 
   // --- lifecycle -----------------------------------------------------------
+  // Sweep stale activity lines (agent died mid-turn, room went quiet).
+  const activitySweep = setInterval(() => {
+    if (pruneActivities()) fullRedraw();
+  }, 15_000);
+
   function teardown() {
+    clearInterval(activitySweep);
     write(`${CSI}?2004l`); // bracketed paste off
     write(`${CSI}r`); // reset scroll region
     write(`${CSI}?1049l`); // leave alt screen
