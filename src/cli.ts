@@ -10,7 +10,7 @@
 
 import { mkdirSync, openSync } from "node:fs";
 import { userInfo } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { DEFAULT_PORT, sanitizeName, sanitizeRoom } from "./protocol";
 import type { ChatMessage } from "./protocol";
 import { dataDir } from "./store";
@@ -41,7 +41,11 @@ function parseArgv(argv: string[]): Parsed {
   return { args, flags };
 }
 
-const { args, flags } = parseArgv(process.argv.slice(2));
+// Everything after a bare `--` is a command to spawn (for `board pipe`).
+const rawArgv = process.argv.slice(2);
+const sepIdx = rawArgv.indexOf("--");
+const pipeCmd = sepIdx === -1 ? [] : rawArgv.slice(sepIdx + 1);
+const { args, flags } = parseArgv(sepIdx === -1 ? rawArgv : rawArgv.slice(0, sepIdx));
 const command = args[0];
 const port = Number(flags.port ?? DEFAULT_PORT);
 const base = `http://localhost:${port}`;
@@ -77,6 +81,18 @@ async function ensureServer() {
   process.exit(1);
 }
 
+/** Room for project-centric commands: --room flag, else the cwd's name. */
+const cwdRoom = () => sanitizeRoom(String(flags.room ?? basename(process.cwd())));
+
+async function bindProject(room: string): Promise<void> {
+  const res = await fetch(`${base}/rooms/${room}/project`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ dir: process.cwd() }),
+  });
+  if (!res.ok) console.error(`warning: could not bind project: ${await res.text()}`);
+}
+
 async function roomCursor(room: string): Promise<number> {
   const res = await fetch(`${base}/rooms/${room}/messages?since=0&limit=1`);
   const body = (await res.json()) as { cursor: number };
@@ -87,12 +103,27 @@ function printHelp() {
   console.log(`board — a local room where humans and agents collaborate
 
 usage:
+  board                                 project mode: bind the cwd to a room named
+                                        after it, open the TUI (same as: board up)
+  board spawn <harness> <name> [role…]  spawn an agent into the cwd's room, working
+                                        in its own git worktree (branch board/<name>)
+  board agents [--room r]               list spawned agents and their status
+  board kill <name> [--room r]          stop a spawned agent
+  board diff <name> [--room r]          print an agent's branch diff (pipe to less)
+  board merge <name> [--room r]         merge an agent's branch into your tree
+
   board join <room> [--name you]        join a room in a live chat TUI
   board invite <room> --name <agent>    print instructions to paste into any agent
   board send <room> <text...> [--name]  post a single message (default kind: human)
   board tail <room> [--json] [--since]  follow a room's messages on stdout
+  board stdio <room> [--name] [--plain] be the connection: room -> stdout, stdin -> room
+  board pipe <room> --name <n> -- <cmd> spawn <cmd>, wire its stdio into the room
+                                        (stdout bursts buffered; --line to post per line)
+  board votes <room>                    list votes and results
   board rooms                           list rooms and who's in them
   board serve [--port N]                run the server in the foreground
+
+vote from the TUI:  /vote <question> [| opt | opt]   /cast v1 <option>   /close v1   /votes
 
 options:
   --port N     server port (default ${DEFAULT_PORT}, or BOARD_PORT)
@@ -102,6 +133,108 @@ data lives in ${dataDir} (override with BOARD_DIR)`);
 }
 
 switch (command) {
+  case undefined:
+  case "up": {
+    const room = cwdRoom();
+    await ensureServer();
+    await bindProject(room);
+    const { runTui } = await import("./tui");
+    await runTui({ room, name: defaultName(), port });
+    break;
+  }
+
+  case "spawn": {
+    const harness = args[1];
+    const name = args[2];
+    if (!harness || !name) {
+      console.error("usage: board spawn <harness> <name> [role text…]  (run inside the project dir)");
+      process.exit(1);
+    }
+    const room = cwdRoom();
+    await ensureServer();
+    await bindProject(room);
+    const res = await fetch(`${base}/rooms/${room}/agents/${name}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ harness, role: args.slice(3).join(" ") }),
+    });
+    const body = (await res.json()) as { error?: string; agent?: { branch: string; workspace: string } };
+    if (!res.ok) {
+      console.error(`spawn failed: ${body.error}`);
+      process.exit(1);
+    }
+    console.log(`spawned ${name} (${harness}) in #${room} — branch ${body.agent!.branch}`);
+    console.log(`worktree: ${body.agent!.workspace}`);
+    break;
+  }
+
+  case "agents": {
+    const room = cwdRoom();
+    await ensureServer();
+    const res = await fetch(`${base}/rooms/${room}/agents`);
+    const { agents } = (await res.json()) as {
+      agents: { name: string; harness: string; status: string; branch: string; role: string }[];
+    };
+    if (agents.length === 0) {
+      console.log(`no agents in #${room} — spawn one with: board spawn claude alice`);
+      break;
+    }
+    for (const a of agents) {
+      console.log(`${a.name}  ${a.harness}  [${a.status}]  ${a.branch}${a.role ? `  · ${a.role}` : ""}`);
+    }
+    break;
+  }
+
+  case "kill": {
+    const name = args[1];
+    if (!name) {
+      console.error("usage: board kill <name> [--room r]");
+      process.exit(1);
+    }
+    const room = cwdRoom();
+    await ensureServer();
+    const res = await fetch(`${base}/rooms/${room}/agents/${name}`, { method: "DELETE" });
+    if (!res.ok) {
+      console.error(`kill failed: ${((await res.json()) as { error?: string }).error}`);
+      process.exit(1);
+    }
+    console.log(`stopped ${name}`);
+    break;
+  }
+
+  case "diff": {
+    const name = args[1];
+    if (!name) {
+      console.error("usage: board diff <name> [--room r]");
+      process.exit(1);
+    }
+    const room = cwdRoom();
+    await ensureServer();
+    const res = await fetch(`${base}/rooms/${room}/agents/${name}/diff`);
+    const body = (await res.json()) as { error?: string; stat?: string; diff?: string; dirty?: string };
+    if (!res.ok) {
+      console.error(`diff failed: ${body.error}`);
+      process.exit(1);
+    }
+    if (body.dirty) console.error(`# uncommitted in worktree:\n${body.dirty}\n`);
+    console.log(body.diff || "(no committed changes vs your tree)");
+    break;
+  }
+
+  case "merge": {
+    const name = args[1];
+    if (!name) {
+      console.error("usage: board merge <name> [--room r]");
+      process.exit(1);
+    }
+    const room = cwdRoom();
+    await ensureServer();
+    const res = await fetch(`${base}/rooms/${room}/agents/${name}/merge`, { method: "POST" });
+    const body = (await res.json()) as { ok: boolean; output: string };
+    console.log(body.output);
+    process.exit(body.ok ? 0 : 1);
+  }
+
   case "serve": {
     const { startServer } = await import("./server");
     const srv = startServer(port);
@@ -164,6 +297,54 @@ switch (command) {
       } catch {
         await Bun.sleep(1000);
       }
+    }
+    break;
+  }
+
+  case "stdio": {
+    const room = sanitizeRoom(args[1] ?? "lobby");
+    await ensureServer();
+    const { runStdio } = await import("./stdio");
+    runStdio({ room, name: defaultName(), port, plain: Boolean(flags.plain) });
+    break;
+  }
+
+  case "pipe": {
+    const room = sanitizeRoom(args[1] ?? "lobby");
+    if (pipeCmd.length === 0) {
+      console.error("usage: board pipe <room> --name <bot> [--plain] [--line] -- <command...>");
+      process.exit(1);
+    }
+    await ensureServer();
+    const { runPipe } = await import("./stdio");
+    runPipe({
+      room,
+      name: defaultName(),
+      port,
+      cmd: pipeCmd,
+      plain: Boolean(flags.plain),
+      line: Boolean(flags.line),
+      flushMs: flags["flush-ms"] ? Number(flags["flush-ms"]) : undefined,
+    });
+    break;
+  }
+
+  case "votes": {
+    const room = sanitizeRoom(args[1] ?? "lobby");
+    await ensureServer();
+    const res = await fetch(`${base}/rooms/${room}/votes`);
+    const { votes } = (await res.json()) as {
+      votes: { id: string; status: string; question: string; options: string[]; ballots: Record<string, string>; result?: { winner: string | null } }[];
+    };
+    if (votes.length === 0) {
+      console.log("no votes yet");
+      break;
+    }
+    for (const v of votes) {
+      const tally = v.options
+        .map((o) => `${o} ${Object.values(v.ballots).filter((b) => b === o).length}`)
+        .join(" · ");
+      console.log(`${v.id} [${v.status}] "${v.question}" (${tally})${v.result?.winner ? ` → ${v.result.winner}` : ""}`);
     }
     break;
   }
@@ -231,7 +412,6 @@ Keep replies short and conversational — it's a chat room, not a report.`);
   }
 
   case "help":
-  case undefined:
     printHelp();
     break;
 

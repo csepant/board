@@ -4,7 +4,7 @@
 //   - WebSocket at ws://localhost:PORT/ws  (join frame first, then message frames)
 //   - HTTP      GET/POST /rooms/:room/messages  (long-poll with ?since=<seq>&wait=<sec>)
 
-export type Kind = "human" | "agent";
+export type Kind = "human" | "agent" | "system";
 
 export interface Participant {
   name: string;
@@ -21,6 +21,36 @@ export interface ChatMessage {
   kind: Kind;
   text: string;
   ts: number;
+  /** Structured payload on system messages (e.g. vote events). */
+  data?: { vote?: VoteEvent };
+}
+
+// --- votes ---------------------------------------------------------------
+
+export interface VoteResult {
+  tally: Record<string, number>;
+  /** null on a tie or when no ballots were cast. */
+  winner: string | null;
+}
+
+export interface Vote {
+  id: string;
+  room: string;
+  question: string;
+  options: string[];
+  openedBy: string;
+  openedAt: number;
+  status: "open" | "closed";
+  /** participant name -> chosen option (open ballots, recasting allowed) */
+  ballots: Record<string, string>;
+  closedBy?: string;
+  closedAt?: number;
+  result?: VoteResult;
+}
+
+export interface VoteEvent {
+  event: "opened" | "ballot" | "closed";
+  vote: Vote;
 }
 
 // client -> server

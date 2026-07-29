@@ -3,7 +3,7 @@
 
 import { StringDecoder } from "node:string_decoder";
 import { BoardClient } from "./client";
-import type { ChatMessage, Participant } from "./protocol";
+import type { ChatMessage, Participant, Vote } from "./protocol";
 import { DEFAULT_PORT } from "./protocol";
 
 const ESC = "\x1b";
@@ -160,7 +160,7 @@ export async function runTui(opts: { room: string; name: string; port?: number }
       for (const msg of welcome.history) {
         if (!seenIds.has(msg.id)) {
           seenIds.add(msg.id);
-          entries.push({ kind: "msg", msg });
+          entries.push(msg.kind === "system" ? { kind: "sys", text: msg.text, ts: msg.ts } : { kind: "msg", msg });
         }
       }
       fullRedraw();
@@ -169,7 +169,8 @@ export async function runTui(opts: { room: string; name: string; port?: number }
     onMessage: (msg) => {
       if (seenIds.has(msg.id)) return;
       seenIds.add(msg.id);
-      appendEntry({ kind: "msg", msg });
+      if (msg.kind === "system") appendEntry({ kind: "sys", text: msg.text, ts: msg.ts });
+      else appendEntry({ kind: "msg", msg });
     },
     onPresence: (presence) => {
       participants = presence.participants;
@@ -197,10 +198,61 @@ export async function runTui(opts: { room: string; name: string; port?: number }
       return;
     }
     inputHistory.push(text);
+    drawInput();
 
     if (text === "/quit" || text === "/exit" || text === "/q") return quit();
     if (text === "/help") {
-      sysLine("commands: /who  /quit  ·  keys: ctrl+c quit, ctrl+l redraw, ↑/↓ input history");
+      sysLine("agents: /spawn <harness> <name> [role…] · /agents · /kill <name> · /diff <name> · /merge <name>");
+      sysLine("votes: /vote <question> [| opt | opt] · /cast <id> <option> · /close <id> · /votes");
+      sysLine("misc: /who · /quit · keys: ctrl+c quit, ctrl+l redraw, ↑/↓ input history");
+      return;
+    }
+    const spawn = text.match(/^\/spawn\s+(\S+)\s+(\S+)(?:\s+(.+))?$/);
+    if (spawn) {
+      void api(`/agents/${spawn[2]}`, "POST", { harness: spawn[1], role: spawn[3] ?? "" }).then(
+        (err) => err && sysLine(err),
+      );
+      return;
+    }
+    if (text === "/agents") {
+      void (async () => {
+        try {
+          const res = await fetch(`http://localhost:${port}/rooms/${opts.room}/agents`);
+          const { agents } = (await res.json()) as {
+            agents: { name: string; harness: string; status: string; branch: string }[];
+          };
+          if (agents.length === 0) return sysLine("no agents — /spawn claude alice [role…]");
+          for (const a of agents) sysLine(`${a.name} · ${a.harness} · ${a.status} · ${a.branch}`);
+        } catch (e) {
+          sysLine(`agents failed: ${e}`);
+        }
+      })();
+      return;
+    }
+    const kill = text.match(/^\/kill\s+(\S+)$/);
+    if (kill) {
+      void api(`/agents/${kill[1]}`, "DELETE").then((err) => err && sysLine(err));
+      return;
+    }
+    const diff = text.match(/^\/diff\s+(\S+)$/);
+    if (diff) {
+      void (async () => {
+        try {
+          const res = await fetch(`http://localhost:${port}/rooms/${opts.room}/agents/${diff[1]}/diff`);
+          const body = (await res.json()) as { error?: string; stat?: string; dirty?: string };
+          if (!res.ok) return sysLine(`diff failed: ${body.error}`);
+          sysLine(body.stat?.trim() ? body.stat.trim() : "no committed changes vs your tree");
+          if (body.dirty?.trim()) sysLine(`uncommitted in worktree:\n${body.dirty.trim()}`);
+          sysLine(`full diff: board diff ${diff[1]} (in a terminal)`);
+        } catch (e) {
+          sysLine(`diff failed: ${e}`);
+        }
+      })();
+      return;
+    }
+    const merge = text.match(/^\/merge\s+(\S+)$/);
+    if (merge) {
+      void api(`/agents/${merge[1]}/merge`, "POST").then((err) => err && sysLine(err));
       return;
     }
     if (text === "/who") {
@@ -209,8 +261,63 @@ export async function runTui(opts: { room: string; name: string; port?: number }
       );
       return;
     }
+    if (text.startsWith("/vote ")) {
+      const [question, ...options] = text.slice(6).split("|").map((s) => s.trim());
+      void voteApi("", { question, options }).then((err) => err && sysLine(err));
+      return;
+    }
+    if (text === "/votes") {
+      void listVotes();
+      return;
+    }
+    const cast = text.match(/^\/cast\s+(\S+)\s+(.+)$/);
+    if (cast) {
+      void voteApi(`/${cast[1]}/ballots`, { option: cast[2].trim() }).then((err) => err && sysLine(err));
+      return;
+    }
+    const close = text.match(/^\/close\s+(\S+)$/);
+    if (close) {
+      void voteApi(`/${close[1]}/close`, {}).then((err) => err && sysLine(err));
+      return;
+    }
     if (!client.send(text)) sysLine("not connected — message not sent");
     drawInput();
+  }
+
+  /** Call a room endpoint; returns an error string or null (results arrive as system messages). */
+  async function api(path: string, method: string, body?: Record<string, unknown>): Promise<string | null> {
+    try {
+      const res = await fetch(`http://localhost:${port}/rooms/${opts.room}${path}`, {
+        method,
+        headers: { "content-type": "application/json" },
+        ...(body ? { body: JSON.stringify({ from: you, ...body }) } : {}),
+      });
+      if (!res.ok) {
+        const err = (await res.json()) as { error?: string };
+        return `failed: ${err.error ?? res.status}`;
+      }
+      return null;
+    } catch (e) {
+      return `failed: ${e}`;
+    }
+  }
+
+  const voteApi = (path: string, body: Record<string, unknown>) => api(`/votes${path}`, "POST", body);
+
+  async function listVotes() {
+    try {
+      const res = await fetch(`http://localhost:${port}/rooms/${opts.room}/votes`);
+      const { votes } = (await res.json()) as { votes: Vote[] };
+      if (votes.length === 0) return sysLine("no votes yet — open one with /vote <question> [| opt | opt]");
+      for (const v of votes.slice(-10)) {
+        const tally = v.options
+          .map((o) => `${o} ${Object.values(v.ballots).filter((b) => b === o).length}`)
+          .join(" · ");
+        sysLine(`${v.id} [${v.status}] "${v.question}" (${tally})${v.result?.winner ? ` → ${v.result.winner}` : ""}`);
+      }
+    } catch (e) {
+      sysLine(`could not list votes: ${e}`);
+    }
   }
 
   function insert(s: string) {

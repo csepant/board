@@ -28,8 +28,15 @@ export class BoardClient {
   private ws?: WebSocket;
   private closed = false;
   private retries = 0;
+  /** Messages sent while disconnected; flushed after the next welcome. */
+  private outbox: string[] = [];
 
   constructor(private opts: BoardClientOptions) {}
+
+  /** Number of messages queued waiting for a connection. */
+  get pending(): number {
+    return this.outbox.length;
+  }
 
   get url(): string {
     return `ws://${this.opts.host ?? "localhost"}:${this.opts.port ?? DEFAULT_PORT}/ws`;
@@ -64,6 +71,9 @@ export class BoardClient {
         case "welcome":
           this.cursor = Math.max(this.cursor, frame.cursor);
           this.opts.onWelcome?.(frame);
+          for (const text of this.outbox.splice(0)) {
+            ws.send(JSON.stringify({ type: "message", text }));
+          }
           break;
         case "message":
           this.cursor = Math.max(this.cursor, frame.seq);
@@ -90,12 +100,18 @@ export class BoardClient {
     };
   }
 
-  send(text: string) {
+  /**
+   * Send now if connected, otherwise queue for the next welcome.
+   * Returns false only when the queue overflowed and the message was dropped.
+   */
+  send(text: string): boolean {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: "message", text }));
       return true;
     }
-    return false;
+    if (this.outbox.length >= 100) return false;
+    this.outbox.push(text);
+    return true;
   }
 
   close() {
