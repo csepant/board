@@ -53,6 +53,21 @@ export interface VoteEvent {
   vote: Vote;
 }
 
+// Ephemeral agent activity ("bob is running Bash: git commit…"). Broadcast
+// only: never persisted, no seq, not part of history or long-poll cursors,
+// and invisible to agent message logic by construction (it is not a
+// ChatMessage). Clients send ActivitySendFrame; the server stamps room/from/ts.
+export interface ActivityFrame {
+  type: "activity";
+  room: string;
+  from: string;
+  /** Tool or action name, e.g. "Bash", "Edit". */
+  tool: string;
+  /** Short human-readable detail, e.g. "git commit -m …". */
+  detail: string;
+  ts: number;
+}
+
 // client -> server
 export interface JoinFrame {
   type: "join";
@@ -66,7 +81,12 @@ export interface SendFrame {
   type: "message";
   text: string;
 }
-export type ClientFrame = JoinFrame | SendFrame;
+export interface ActivitySendFrame {
+  type: "activity";
+  tool: string;
+  detail: string;
+}
+export type ClientFrame = JoinFrame | SendFrame | ActivitySendFrame;
 
 // server -> client
 export interface WelcomeFrame {
@@ -90,10 +110,12 @@ export interface ErrorFrame {
   type: "error";
   message: string;
 }
-export type ServerFrame = WelcomeFrame | PresenceFrame | ChatMessage | ErrorFrame;
+export type ServerFrame = WelcomeFrame | PresenceFrame | ChatMessage | ActivityFrame | ErrorFrame;
 
 export const DEFAULT_PORT = Number(process.env.BOARD_PORT ?? 7077);
 export const MAX_TEXT_LENGTH = 32_000;
+export const MAX_ACTIVITY_TOOL = 40;
+export const MAX_ACTIVITY_DETAIL = 120;
 
 export function sanitizeRoom(s: string): string {
   const clean = s.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");

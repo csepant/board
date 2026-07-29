@@ -3,6 +3,7 @@
 // never see duplicate messages across reconnects.
 
 import type {
+  ActivityFrame,
   ChatMessage,
   Kind,
   PresenceFrame,
@@ -20,6 +21,7 @@ export interface BoardClientOptions {
   onWelcome?: (welcome: WelcomeFrame) => void;
   onMessage?: (msg: ChatMessage) => void;
   onPresence?: (presence: PresenceFrame) => void;
+  onActivity?: (activity: ActivityFrame) => void;
   onStatus?: (status: string) => void;
 }
 
@@ -81,6 +83,9 @@ export class BoardClient {
           break;
         case "presence":
           this.opts.onPresence?.(frame);
+          break;
+        case "activity":
+          this.opts.onActivity?.(frame);
           break;
         case "error":
           this.opts.onStatus?.(`server error: ${frame.message}`);

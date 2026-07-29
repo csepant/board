@@ -8,6 +8,7 @@
 
 import type { Server, ServerWebSocket } from "bun";
 import type {
+  ActivityFrame,
   ChatMessage,
   ClientFrame,
   Kind,
@@ -16,7 +17,14 @@ import type {
   VoteEvent,
   WelcomeFrame,
 } from "./protocol";
-import { DEFAULT_PORT, MAX_TEXT_LENGTH, sanitizeName, sanitizeRoom } from "./protocol";
+import {
+  DEFAULT_PORT,
+  MAX_ACTIVITY_DETAIL,
+  MAX_ACTIVITY_TOOL,
+  MAX_TEXT_LENGTH,
+  sanitizeName,
+  sanitizeRoom,
+} from "./protocol";
 import {
   appendMessage,
   dataDir,
@@ -116,6 +124,20 @@ function postMessage(
   server.publish(topic(room.name), JSON.stringify(msg));
   for (const wake of room.waiters.splice(0)) wake();
   return msg;
+}
+
+/** Ephemeral agent activity — publish only. No seq, no history, no disk, and
+ *  no waiter wake, so long-poll cursors and agents never see it. */
+function postActivity(room: Room, from: string, tool: string, detail: string) {
+  const frame: ActivityFrame = {
+    type: "activity",
+    room: room.name,
+    from,
+    tool: tool.slice(0, MAX_ACTIVITY_TOOL),
+    detail: detail.slice(0, MAX_ACTIVITY_DETAIL),
+    ts: Date.now(),
+  };
+  server.publish(topic(room.name), JSON.stringify(frame));
 }
 
 function broadcastPresence(room: Room, event: "join" | "leave", who: Participant) {
@@ -363,6 +385,22 @@ export function startServer(port: number = DEFAULT_PORT): Server<WSData> {
         }
       }
 
+      const activityMatch = path.match(/^\/rooms\/([^/]+)\/activity$/);
+      if (activityMatch && req.method === "POST") {
+        const room = getRoom(sanitizeRoom(decodeURIComponent(activityMatch[1])));
+        let body: { from?: string; tool?: string; detail?: string };
+        try {
+          body = (await req.json()) as typeof body;
+        } catch {
+          return json({ error: "body must be JSON: {from, tool, detail}" }, 400);
+        }
+        if (!body.from || typeof body.tool !== "string" || typeof body.detail !== "string") {
+          return json({ error: "required fields: from (string), tool (string), detail (string)" }, 400);
+        }
+        postActivity(room, sanitizeName(body.from), body.tool, body.detail);
+        return json({ ok: true });
+      }
+
       const projectMatch = path.match(/^\/rooms\/([^/]+)\/project$/);
       if (projectMatch) {
         const room = getRoom(sanitizeRoom(decodeURIComponent(projectMatch[1])));
@@ -534,6 +572,11 @@ export function startServer(port: number = DEFAULT_PORT): Server<WSData> {
         if (frame.type === "message" && typeof frame.text === "string" && frame.text.length > 0) {
           const room = getRoom(ws.data.room);
           postMessage(room, ws.data.name!, ws.data.kind!, frame.text);
+        }
+
+        if (frame.type === "activity" && typeof frame.tool === "string" && typeof frame.detail === "string") {
+          const room = getRoom(ws.data.room);
+          postActivity(room, ws.data.name!, frame.tool, frame.detail);
         }
       },
 
