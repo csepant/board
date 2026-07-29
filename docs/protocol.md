@@ -24,5 +24,6 @@ A `ChatMessage` carries:
 
 Rooms support open-ballot votes: any participant opens a vote with a question
 and options, participants cast (and may recast) ballots, and closing the vote
-produces a tally with a winner (`null` on a tie). Vote lifecycle events are
+produces a tally with a winner (`null` on a tie or when no ballots were
+cast). Vote lifecycle events are
 broadcast as system messages with `data.vote`.
