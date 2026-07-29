@@ -9,7 +9,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { BoardClient } from "./client";
-import { buildArgv, loadHarnesses, parseOutput } from "./harness";
+import { activitiesFromLine, buildArgv, loadHarnesses, parseOutput } from "./harness";
+import type { Activity } from "./harness";
 import type { ChatMessage } from "./protocol";
 import { dataDir } from "./store";
 
@@ -91,6 +92,58 @@ ${fresh}
 Do whatever work is being asked of you now, then output ONLY your chat reply (no markdown headers, no name prefix).`;
 }
 
+// Activity throttle: at most one frame per second, latest-wins. Keeps a busy
+// turn from flooding the socket while the status line still tracks reality.
+const ACTIVITY_INTERVAL_MS = 1000;
+let lastActivityAt = 0;
+let pendingActivity: Activity | null = null;
+let activityTimer: ReturnType<typeof setTimeout> | null = null;
+
+function emitActivity(activity: Activity) {
+  const now = Date.now();
+  if (now - lastActivityAt >= ACTIVITY_INTERVAL_MS) {
+    lastActivityAt = now;
+    client.sendActivity(activity.tool, activity.detail);
+    return;
+  }
+  pendingActivity = activity;
+  activityTimer ??= setTimeout(() => {
+    activityTimer = null;
+    if (!pendingActivity) return;
+    lastActivityAt = Date.now();
+    client.sendActivity(pendingActivity.tool, pendingActivity.detail);
+    pendingActivity = null;
+  }, ACTIVITY_INTERVAL_MS - (now - lastActivityAt));
+}
+
+function dropPendingActivity() {
+  pendingActivity = null;
+  if (activityTimer) {
+    clearTimeout(activityTimer);
+    activityTimer = null;
+  }
+}
+
+/** Read stdout to completion, emitting activity frames as complete lines arrive. */
+async function collectStdout(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const decoder = new TextDecoder();
+  let full = "";
+  let lineBuf = "";
+  for await (const chunk of stream) {
+    const text = decoder.decode(chunk, { stream: true });
+    full += text;
+    lineBuf += text;
+    let nl: number;
+    while ((nl = lineBuf.indexOf("\n")) !== -1) {
+      for (const activity of activitiesFromLine(harness, lineBuf.slice(0, nl))) {
+        emitActivity(activity);
+      }
+      lineBuf = lineBuf.slice(nl + 1);
+    }
+  }
+  return full + decoder.decode();
+}
+
 async function runTurn() {
   if (busy) {
     queued = true;
@@ -102,9 +155,10 @@ async function runTurn() {
     console.error(`turn: ${argv[0]} (session=${session ?? "new"})`);
     const proc = Bun.spawn(argv, { cwd: workspace, stdout: "pipe", stderr: "pipe" });
     const timeout = setTimeout(() => proc.kill(), TURN_TIMEOUT_MS);
-    const stdout = await new Response(proc.stdout).text();
+    const stdout = await collectStdout(proc.stdout);
     const exitCode = await proc.exited;
     clearTimeout(timeout);
+    dropPendingActivity(); // the turn is over; don't let a stale line fire after the reply
 
     if (exitCode !== 0) {
       const stderr = (await new Response(proc.stderr).text()).slice(-500);

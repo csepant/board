@@ -114,6 +114,17 @@ export class BoardClient {
     return true;
   }
 
+  /**
+   * Fire-and-forget ephemeral activity frame ("what am I doing right now").
+   * Never queued: a stale activity line is worse than none, so frames sent
+   * while disconnected are dropped. Servers without activity support ignore it.
+   */
+  sendActivity(tool: string, detail: string) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "activity", tool, detail }));
+    }
+  }
+
   close() {
     this.closed = true;
     this.ws?.close();
